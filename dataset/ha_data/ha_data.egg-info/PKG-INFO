@@ -1,0 +1,10 @@
+Metadata-Version: 2.1
+Name: ha_data
+Version: 0.0.0
+Author: 
+
+# ha_data
+- Install
+    ```
+    pip install -e .
+    ```
