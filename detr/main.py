@@ -67,6 +67,7 @@ def get_args_parser():
     parser.add_argument('--ckpt_path', type=str, default=None, help='path to checkpoint')
 
     parser.add_argument('--use_tactile', action='store_true')
+    parser.add_argument('--use_differential_tactile', action='store_true')
 
     parser.add_argument('--resume_path', type=str, default=None, help='path to resume checkpoint')
 

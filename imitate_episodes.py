@@ -28,7 +28,7 @@ from PIL import Image
 import torchvision.transforms.functional as TF
 
 import cv2
-
+import swanlab
 
 
 def main(args):
@@ -43,6 +43,7 @@ def main(args):
     batch_size_val = args['batch_size']
     num_epochs = args['num_epochs']
     use_tactile = args['use_tactile']
+    use_differential_tactile = args.get('use_differential_tactile', False)
     resume_path = args['resume_path']
 
     from datetime import datetime
@@ -53,6 +54,9 @@ def main(args):
     if use_tactile:
         ckpt_dir = ckpt_dir + "_tactile"
         timestamp = timestamp + "_tactile"
+    if use_differential_tactile:
+        ckpt_dir = ckpt_dir + "_difftac"
+        timestamp = timestamp + "_difftac"
 
 
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -79,7 +83,8 @@ def main(args):
                          'dec_layers': dec_layers,
                          'nheads': nheads,
                          'camera_names': camera_names,
-                         'use_tactile': use_tactile
+                         'use_tactile': use_tactile,
+                         'use_differential_tactile': use_differential_tactile,
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
@@ -102,6 +107,7 @@ def main(args):
         'camera_names': camera_names,
         # 'real_robot': not is_sim,
         'use_tactile': use_tactile,
+        'use_differential_tactile': use_differential_tactile,
         'resume_path': resume_path,
         'lr_config': {
             'policy': 'CosineAnnealing',
@@ -223,6 +229,7 @@ def train_bc(train_dataloader, normalizer, dataset, timestamp, config):
     policy_class = config['policy_class']
     policy_config = config['policy_config']
     use_tactile = config['use_tactile']
+    use_differential_tactile = config.get('use_differential_tactile', False)
     resume_path = config.get('resume_path', None)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -254,6 +261,42 @@ def train_bc(train_dataloader, normalizer, dataset, timestamp, config):
     global_step = 0
     min_val_loss = np.inf
     best_ckpt_info = None
+
+    # === SwanLab init ===
+    exp_name = timestamp
+    swanlab.init(
+        project="ViTacFormer-DTC",
+        experiment_name=exp_name,
+        config={
+            # training
+            "task_name":               config.get('task_name', ''),
+            "policy_class":            policy_class,
+            "seed":                    seed,
+            "num_epochs":              num_epochs,
+            "lr":                      config.get('lr', ''),
+            "batch_size":              policy_config.get('batch_size', ''),
+            # model
+            "hidden_dim":              policy_config.get('hidden_dim', ''),
+            "dim_feedforward":         policy_config.get('dim_feedforward', ''),
+            "enc_layers":              policy_config.get('enc_layers', ''),
+            "dec_layers":              policy_config.get('dec_layers', ''),
+            "nheads":                  policy_config.get('nheads', ''),
+            "num_queries":             policy_config.get('num_queries', ''),
+            "kl_weight":               policy_config.get('kl_weight', ''),
+            "backbone":                policy_config.get('backbone', ''),
+            # tactile flags
+            "use_tactile":             use_tactile,
+            "use_differential_tactile": use_differential_tactile,
+            # scheduler
+            "warmup_iters":            config['lr_config']['warmup_iters'],
+            "warmup_ratio":            config['lr_config']['warmup_ratio'],
+            "min_lr_ratio":            config['lr_config']['min_lr_ratio'],
+            # resume
+            "resume_path":             resume_path or "",
+            "ckpt_dir":                ckpt_dir,
+        },
+        logdir=ckpt_dir,
+    )
 
     # === resume ===
     if resume_path is not None and os.path.exists(resume_path):
@@ -315,10 +358,23 @@ def train_bc(train_dataloader, normalizer, dataset, timestamp, config):
                 train_losses.append(loss.item())
                 train_history.append(detach_dict(forward_dict))
 
+                current_lr = scheduler.get_last_lr()[0]
                 tepoch.set_postfix(
                     loss=loss.item(),
+                    lr=f"{current_lr:.2e}",
                     refresh=False
                 )
+
+                # step-level logging
+                step_log = {
+                    "train/loss":  loss.item(),
+                    "train/l1":    forward_dict['l1'].item(),
+                    "train/kl":    forward_dict['kl'].item(),
+                    "train/lr":    current_lr,
+                }
+                if 'l1_tac' in forward_dict:
+                    step_log["train/l1_tac"] = forward_dict['l1_tac'].item()
+                swanlab.log(step_log, step=global_step)
 
                 global_step += 1
 
@@ -330,6 +386,11 @@ def train_bc(train_dataloader, normalizer, dataset, timestamp, config):
         for k, v in epoch_summary.items():
             summary_string += f'{k}: {v.item():.3f} '
         print(summary_string)
+
+        # epoch-level logging
+        epoch_log = {f"epoch/{k}": v.item() for k, v in epoch_summary.items()}
+        epoch_log["epoch/epoch"] = epoch
+        swanlab.log(epoch_log, step=global_step)
 
         if epoch % 5 == 0:
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_loss_{epoch_train_loss:.3f}.ckpt')
@@ -351,6 +412,7 @@ def train_bc(train_dataloader, normalizer, dataset, timestamp, config):
     torch.save(best_state_dict, ckpt_path)
     print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
 
+    swanlab.finish()
 
     return best_ckpt_info
 
@@ -374,6 +436,7 @@ if __name__ == '__main__':
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
     parser.add_argument('--use_tactile', action='store_true')
+    parser.add_argument('--use_differential_tactile', action='store_true')
     parser.add_argument('--resume_path', type=str, default=None, help='path to resume checkpoint')
 
     main(vars(parser.parse_args()))

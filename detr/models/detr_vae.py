@@ -14,6 +14,30 @@ import IPython
 e = IPython.embed
 
 
+class DifferentialTactileEncoder(nn.Module):
+    """
+    Encode a flattened tactile history [B, T*D] into a hidden_dim token
+    by computing frame-wise first-order differences along the time axis.
+
+    d_0 = 0
+    d_t = x_t - x_{t-1}   for t = 1 .. T-1
+    """
+    def __init__(self, tactile_dim_all: int, hidden_dim: int, tac_history_cnt: int = 18):
+        super().__init__()
+        self.tac_history_cnt = tac_history_cnt
+        self.tactile_dim = tactile_dim_all // tac_history_cnt
+        self.proj = nn.Linear(tactile_dim_all, hidden_dim)
+
+    def forward(self, tactile_flat):
+        # tactile_flat: [B, T*D]
+        B = tactile_flat.shape[0]
+        x = tactile_flat.view(B, self.tac_history_cnt, self.tactile_dim)  # [B, T, D]
+        diff = torch.zeros_like(x)                                         # d_0 = 0
+        diff[:, 1:, :] = x[:, 1:, :] - x[:, :-1, :]                      # d_t = x_t - x_{t-1}
+        diff_flat = diff.view(B, -1)                                       # [B, T*D]
+        return self.proj(diff_flat)                                        # [B, hidden_dim]
+
+
 def reparametrize(mu, logvar):
     std = logvar.div(2).exp()
     eps = Variable(std.data.new(std.size()).normal_())
@@ -33,7 +57,7 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, use_tactile):
+    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, use_tactile, use_differential_tactile=False):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -69,10 +93,18 @@ class DETRVAE(nn.Module):
             self.pos = torch.nn.Embedding(2, hidden_dim)
             self.backbones = None
 
+        self.use_differential_tactile = use_differential_tactile
         if use_tactile:
             self.input_proj_tactile = nn.Linear(tactile_dim_all, hidden_dim)
             self.tactile_head = nn.Linear(hidden_dim, tactile_dim)
             self.query_embed_tactile = nn.Embedding(18, hidden_dim)
+            if use_differential_tactile:
+                self.tactile_diff_encoder = DifferentialTactileEncoder(
+                    tactile_dim_all=tactile_dim_all,
+                    hidden_dim=hidden_dim,
+                    tac_history_cnt=18,
+                )
+                self.tactile_fusion = nn.Linear(hidden_dim * 2, hidden_dim)
 
         # encoder extra parameters
         self.latent_dim = 32 # final size of latent z # TODO tune
@@ -147,7 +179,12 @@ class DETRVAE(nn.Module):
             src = torch.cat(all_cam_features, axis=3)
             pos = torch.cat(all_cam_pos, axis=3)
             if self.use_tactile:
-                tactile_input = self.input_proj_tactile(tactile)
+                tactile_input = self.input_proj_tactile(tactile)             # [B, hidden_dim]
+                if self.use_differential_tactile:
+                    diff_input = self.tactile_diff_encoder(tactile)          # [B, hidden_dim]
+                    tactile_input = self.tactile_fusion(
+                        torch.cat([tactile_input, diff_input], dim=-1)       # [B, hidden_dim*2] → [B, hidden_dim]
+                    )
                 hs_tactile = self.transformer(src, None, self.query_embed_tactile.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight, tactile_input, None)[0]
                 tactile_hat = self.tactile_head(hs_tactile)  ##[bs, 18, tactile_dim]
                 B, T, D = tactile_hat.shape
@@ -280,7 +317,8 @@ def build(args):
         state_dim=state_dim,
         num_queries=args.num_queries,
         camera_names=args.camera_names,
-        use_tactile = args.use_tactile
+        use_tactile=args.use_tactile,
+        use_differential_tactile=getattr(args, 'use_differential_tactile', False),
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
