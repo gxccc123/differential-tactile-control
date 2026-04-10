@@ -6,4 +6,8 @@
 --seed 0 \
 --use_tactile \
 --use_differential_tactile \
+--use_swanlab \
+--swanlab_project ViTacFormer-DTC \
+--swanlab_log_interval 10 \
+# --swanlab_mode local \
 # --resume_path ~

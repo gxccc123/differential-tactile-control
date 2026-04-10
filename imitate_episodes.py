@@ -28,7 +28,83 @@ from PIL import Image
 import torchvision.transforms.functional as TF
 
 import cv2
-import swanlab
+
+
+def to_python_scalar(value):
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return value.detach().cpu().item()
+        return value.detach().cpu().float().mean().item()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def init_swanlab_run(config, timestamp):
+    if not config.get('use_swanlab', False):
+        return None
+
+    print(f"[SwanLab] Initializing tracking in {config.get('swanlab_mode', 'cloud')} mode...")
+
+    try:
+        import swanlab
+    except ImportError:
+        print('[SwanLab] swanlab is not installed, skip experiment tracking.')
+        return None
+
+    use_differential_tactile = config.get('use_differential_tactile', False)
+    run_name = config.get('swanlab_run_name') or timestamp
+    init_kwargs = {
+        'project':           config.get('swanlab_project', 'ViTacFormer-DTC'),
+        'experiment_name':   run_name,
+        'config':            config,
+        'logdir':            os.path.join(config['ckpt_dir'], 'swanlab'),
+        'mode':              config.get('swanlab_mode', 'cloud'),
+        'tags': [
+            config.get('task_name', 'unknown_task'),
+            config.get('policy_class', 'unknown_policy'),
+            'tactile'      if config.get('use_tactile')              else 'vision_only',
+            'diff_tactile' if use_differential_tactile               else 'raw_tactile',
+        ],
+    }
+
+    description = config.get('swanlab_description')
+    if description:
+        init_kwargs['description'] = description
+
+    try:
+        run = swanlab.init(**init_kwargs)
+        print('[SwanLab] Tracking initialized.')
+        return run
+    except Exception as e:
+        print(f'[SwanLab] Initialization failed, skip tracking: {e}')
+        return None
+
+
+def log_swanlab_metrics(run, metrics):
+    if run is None:
+        return
+
+    import swanlab
+
+    sanitized = {}
+    for key, value in metrics.items():
+        if value is None:
+            continue
+        sanitized[key] = to_python_scalar(value)
+
+    if sanitized:
+        swanlab.log(sanitized)
+
+
+def finish_swanlab_run(run):
+    if run is None:
+        return
+
+    import swanlab
+    print('[SwanLab] Finishing run...')
+    swanlab.finish()
+    print('[SwanLab] Run finished.')
 
 
 def main(args):
@@ -45,6 +121,7 @@ def main(args):
     use_tactile = args['use_tactile']
     use_differential_tactile = args.get('use_differential_tactile', False)
     resume_path = args['resume_path']
+    use_swanlab = args.get('use_swanlab', False)
 
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -109,6 +186,12 @@ def main(args):
         'use_tactile': use_tactile,
         'use_differential_tactile': use_differential_tactile,
         'resume_path': resume_path,
+        'use_swanlab':             use_swanlab,
+        'swanlab_project':         args.get('swanlab_project', 'ViTacFormer-DTC'),
+        'swanlab_run_name':        args.get('swanlab_run_name', None),
+        'swanlab_mode':            args.get('swanlab_mode', 'cloud'),
+        'swanlab_description':     args.get('swanlab_description', None),
+        'swanlab_log_interval':    args.get('swanlab_log_interval', 10),
         'lr_config': {
             'policy': 'CosineAnnealing',
             'warmup': 'linear',
@@ -151,12 +234,12 @@ def main(args):
         pickle.dump(normalizer, f)
 
     best_ckpt_info = train_bc(train_dataloader, normalizer, train_dataset, timestamp, config)
-    best_epoch, min_val_loss, best_state_dict = best_ckpt_info
+    best_epoch, best_loss, best_state_dict = best_ckpt_info
 
     # save best checkpoint
     ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
     torch.save(best_state_dict, ckpt_path)
-    print(f'Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}')
+    print(f'Best ckpt, loss {best_loss:.6f} @ epoch{best_epoch}')
 
 
 def make_policy(policy_class, policy_config):
@@ -229,8 +312,8 @@ def train_bc(train_dataloader, normalizer, dataset, timestamp, config):
     policy_class = config['policy_class']
     policy_config = config['policy_config']
     use_tactile = config['use_tactile']
-    use_differential_tactile = config.get('use_differential_tactile', False)
     resume_path = config.get('resume_path', None)
+    swanlab_log_interval = max(1, config.get('swanlab_log_interval', 10))
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -238,7 +321,7 @@ def train_bc(train_dataloader, normalizer, dataset, timestamp, config):
 
     start_epoch = 0
     global_step = 0
-    min_val_loss = np.inf
+    best_loss = np.inf
     best_ckpt_info = None
 
     from transformers import get_cosine_schedule_with_warmup
@@ -257,46 +340,17 @@ def train_bc(train_dataloader, normalizer, dataset, timestamp, config):
     )
 
     train_history = []
-    validation_history = []
     global_step = 0
-    min_val_loss = np.inf
+    best_loss = np.inf
     best_ckpt_info = None
 
-    # === SwanLab init ===
-    exp_name = timestamp
-    swanlab.init(
-        project="ViTacFormer-DTC",
-        experiment_name=exp_name,
-        config={
-            # training
-            "task_name":               config.get('task_name', ''),
-            "policy_class":            policy_class,
-            "seed":                    seed,
-            "num_epochs":              num_epochs,
-            "lr":                      config.get('lr', ''),
-            "batch_size":              policy_config.get('batch_size', ''),
-            # model
-            "hidden_dim":              policy_config.get('hidden_dim', ''),
-            "dim_feedforward":         policy_config.get('dim_feedforward', ''),
-            "enc_layers":              policy_config.get('enc_layers', ''),
-            "dec_layers":              policy_config.get('dec_layers', ''),
-            "nheads":                  policy_config.get('nheads', ''),
-            "num_queries":             policy_config.get('num_queries', ''),
-            "kl_weight":               policy_config.get('kl_weight', ''),
-            "backbone":                policy_config.get('backbone', ''),
-            # tactile flags
-            "use_tactile":             use_tactile,
-            "use_differential_tactile": use_differential_tactile,
-            # scheduler
-            "warmup_iters":            config['lr_config']['warmup_iters'],
-            "warmup_ratio":            config['lr_config']['warmup_ratio'],
-            "min_lr_ratio":            config['lr_config']['min_lr_ratio'],
-            # resume
-            "resume_path":             resume_path or "",
-            "ckpt_dir":                ckpt_dir,
-        },
-        logdir=ckpt_dir,
-    )
+    swanlab_run = init_swanlab_run(config, timestamp)
+
+    log_swanlab_metrics(swanlab_run, {
+        'meta/train_dataset_size': len(train_dataloader.dataset),
+        'meta/train_num_batches':  len(train_dataloader),
+        'meta/batch_size':         train_dataloader.batch_size,
+    })
 
     # === resume ===
     if resume_path is not None and os.path.exists(resume_path):
@@ -308,111 +362,104 @@ def train_bc(train_dataloader, normalizer, dataset, timestamp, config):
             scheduler.load_state_dict(checkpoint['scheduler'])
         start_epoch = checkpoint.get('epoch', 0)
         global_step = checkpoint.get('global_step', 0)
-        min_val_loss = checkpoint.get('min_val_loss', np.inf)
+        best_loss = checkpoint.get('best_loss', checkpoint.get('min_val_loss', np.inf))
         best_ckpt_info = checkpoint.get('best_ckpt_info', None)
 
-    for epoch in tqdm(range(start_epoch, num_epochs)):
-        step_log = {}
-        print(f'\nEpoch {epoch}')
-        # if epoch % 5 == 0:
-        #     # validation
-        #     # with torch.inference_mode():
-        #     with torch.no_grad():
-        #         policy.eval()
-        #         epoch_dicts = []
-        #         for data in tqdm(val_dataloader, desc="Validation", leave=False):
-        #             data = dataset.postprocess(data, device, use_tactile)
-        #             forward_dict = forward_pass(data, policy, normalizer, device, use_tactile)
-        #             epoch_dicts.append(forward_dict)
+    try:
+        for epoch in tqdm(range(start_epoch, num_epochs)):
+            print(f'\nEpoch {epoch}')
 
-        #         epoch_summary = compute_dict_mean(epoch_dicts)
-        #         validation_history.append(epoch_summary)
+            # training
+            policy.train()
+            optimizer.zero_grad()
+            epoch_history = []
+            with tqdm(train_dataloader, desc=f"Train Epoch {epoch}", leave=False) as tepoch:
+                for _, data in enumerate(tepoch):
+                    data = dataset.postprocess(data, device, use_tactile)
+                    forward_dict = forward_pass(data, policy, normalizer, device, use_tactile, epoch)
+                    loss = forward_dict['loss']
+                    loss.backward()
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
 
-        #         epoch_val_loss = epoch_summary['loss']
-        #         if epoch_val_loss < min_val_loss:
-        #             min_val_loss = epoch_val_loss
-        #             best_ckpt_info = (epoch, min_val_loss, deepcopy(policy.state_dict()))
+                    detached = detach_dict(forward_dict)
+                    epoch_history.append(detached)
+                    train_history.append(detached)
 
-        #     print(f'Val loss:   {epoch_val_loss:.5f}')
-        #     summary_string = ''
-        #     for k, v in epoch_summary.items():
-        #         summary_string += f'{k}: {v.item():.3f} '
-        #     print(summary_string)
+                    current_lr = optimizer.param_groups[0]['lr']
+                    tepoch.set_postfix(
+                        loss=loss.item(),
+                        lr=f"{current_lr:.2e}",
+                        refresh=False
+                    )
 
-        # training
-        policy.train()
-        optimizer.zero_grad()
-        train_losses = []
-        with tqdm(train_dataloader, desc=f"Train Epoch {epoch}", leave=False) as tepoch:
-            # for batch_idx, data in enumerate(train_dataloader):
-            for batch_idx, data in enumerate(tepoch):
-                data = dataset.postprocess(data, device, use_tactile)
-                forward_dict = forward_pass(data, policy, normalizer, device, use_tactile)
-                # backward
-                loss = forward_dict['loss']
-                loss.backward()
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
+                    global_step += 1
 
-                train_losses.append(loss.item())
-                train_history.append(detach_dict(forward_dict))
+                    if global_step % swanlab_log_interval == 0:
+                        step_metrics = {
+                            f'train/step_{k}': v for k, v in detached.items()
+                        }
+                        step_metrics.update({
+                            'train/lr':          current_lr,
+                            'train/epoch':       epoch,
+                            'train/global_step': global_step,
+                        })
+                        log_swanlab_metrics(swanlab_run, step_metrics)
 
-                current_lr = scheduler.get_last_lr()[0]
-                tepoch.set_postfix(
-                    loss=loss.item(),
-                    lr=f"{current_lr:.2e}",
-                    refresh=False
-                )
+            epoch_summary = compute_dict_mean(epoch_history)
+            epoch_train_loss = epoch_summary['loss']
+            print(f'Train loss: {epoch_train_loss:.5f}')
 
-                # step-level logging
-                step_log = {
-                    "train/loss":  loss.item(),
-                    "train/l1":    forward_dict['l1'].item(),
-                    "train/kl":    forward_dict['kl'].item(),
-                    "train/lr":    current_lr,
-                }
-                if 'l1_tac' in forward_dict:
-                    step_log["train/l1_tac"] = forward_dict['l1_tac'].item()
-                swanlab.log(step_log, step=global_step)
+            summary_string = ''
+            for k, v in epoch_summary.items():
+                summary_string += f'{k}: {v.item():.3f} '
+            print(summary_string)
 
-                global_step += 1
+            if epoch_train_loss < best_loss:
+                best_loss = epoch_train_loss
+                best_ckpt_info = (epoch, best_loss, deepcopy(policy.state_dict()))
 
-        epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
-        epoch_train_loss = epoch_summary['loss']
-        print(f'Train loss: {epoch_train_loss:.5f}')
+            epoch_metrics = {
+                f'train/epoch_{k}': v for k, v in epoch_summary.items()
+            }
+            epoch_metrics.update({
+                'train/epoch':       epoch,
+                'train/global_step': global_step,
+                'train/lr':          optimizer.param_groups[0]['lr'],
+                'train/best_loss':   best_loss,
+            })
+            log_swanlab_metrics(swanlab_run, epoch_metrics)
 
-        summary_string = ''
-        for k, v in epoch_summary.items():
-            summary_string += f'{k}: {v.item():.3f} '
-        print(summary_string)
-
-        # epoch-level logging
-        epoch_log = {f"epoch/{k}": v.item() for k, v in epoch_summary.items()}
-        epoch_log["epoch/epoch"] = epoch
-        swanlab.log(epoch_log, step=global_step)
-
-        if epoch % 5 == 0:
-            ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_loss_{epoch_train_loss:.3f}.ckpt')
-            # torch.save(policy.state_dict(), ckpt_path)
-            torch.save({
-                'model': policy.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'epoch': epoch,
-                'global_step': global_step,
-                'min_val_loss': min_val_loss,
-            }, ckpt_path)
+            if epoch % 5 == 0:
+                ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_loss_{epoch_train_loss:.3f}.ckpt')
+                torch.save({
+                    'model':         policy.state_dict(),
+                    'optimizer':     optimizer.state_dict(),
+                    'scheduler':     scheduler.state_dict(),
+                    'epoch':         epoch,
+                    'global_step':   global_step,
+                    'best_loss':     best_loss,
+                    'min_val_loss':  best_loss,
+                    'best_ckpt_info': best_ckpt_info,
+                }, ckpt_path)
+                log_swanlab_metrics(swanlab_run, {
+                    'checkpoint/epoch':     epoch,
+                    'checkpoint/best_loss': best_loss,
+                })
+    finally:
+        finish_swanlab_run(swanlab_run)
 
     ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
     torch.save(policy.state_dict(), ckpt_path)
 
-    best_epoch, min_val_loss, best_state_dict = best_ckpt_info
-    ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_val_loss_{min_val_loss}.ckpt')
-    torch.save(best_state_dict, ckpt_path)
-    print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
+    if best_ckpt_info is None:
+        best_ckpt_info = (num_epochs - 1, float('inf'), deepcopy(policy.state_dict()))
 
-    swanlab.finish()
+    best_epoch, best_loss, best_state_dict = best_ckpt_info
+    ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_loss_{best_loss}.ckpt')
+    torch.save(best_state_dict, ckpt_path)
+    print(f'Training finished:\nSeed {seed}, best loss {best_loss:.6f} at epoch {best_epoch}')
 
     return best_ckpt_info
 
@@ -438,5 +485,11 @@ if __name__ == '__main__':
     parser.add_argument('--use_tactile', action='store_true')
     parser.add_argument('--use_differential_tactile', action='store_true')
     parser.add_argument('--resume_path', type=str, default=None, help='path to resume checkpoint')
+    parser.add_argument('--use_swanlab', action='store_true')
+    parser.add_argument('--swanlab_project', type=str, default='ViTacFormer-DTC', help='SwanLab project name')
+    parser.add_argument('--swanlab_run_name', type=str, default=None, help='SwanLab experiment name')
+    parser.add_argument('--swanlab_mode', type=str, default='cloud', choices=['cloud', 'local', 'offline', 'disabled'], help='SwanLab logging mode')
+    parser.add_argument('--swanlab_description', type=str, default=None, help='SwanLab experiment description')
+    parser.add_argument('--swanlab_log_interval', type=int, default=10, help='log metrics to SwanLab every N steps')
 
     main(vars(parser.parse_args()))
