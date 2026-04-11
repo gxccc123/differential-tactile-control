@@ -53,7 +53,14 @@ def init_swanlab_run(config, timestamp):
         return None
 
     use_differential_tactile = config.get('use_differential_tactile', False)
+    use_structured_tactile   = config.get('use_structured_tactile',   False)
     run_name = config.get('swanlab_run_name') or timestamp
+    if use_structured_tactile:
+        tac_tag = 'struct_tactile'
+    elif use_differential_tactile:
+        tac_tag = 'diff_tactile'
+    else:
+        tac_tag = 'raw_tactile'
     init_kwargs = {
         'project':           config.get('swanlab_project', 'ViTacFormer-DTC'),
         'experiment_name':   run_name,
@@ -63,8 +70,8 @@ def init_swanlab_run(config, timestamp):
         'tags': [
             config.get('task_name', 'unknown_task'),
             config.get('policy_class', 'unknown_policy'),
-            'tactile'      if config.get('use_tactile')              else 'vision_only',
-            'diff_tactile' if use_differential_tactile               else 'raw_tactile',
+            'tactile' if config.get('use_tactile') else 'vision_only',
+            tac_tag,
         ],
     }
 
@@ -120,6 +127,7 @@ def main(args):
     num_epochs = args['num_epochs']
     use_tactile = args['use_tactile']
     use_differential_tactile = args.get('use_differential_tactile', False)
+    use_structured_tactile = args.get('use_structured_tactile', False)
     resume_path = args['resume_path']
     use_swanlab = args.get('use_swanlab', False)
 
@@ -134,6 +142,9 @@ def main(args):
     if use_differential_tactile:
         ckpt_dir = ckpt_dir + "_difftac"
         timestamp = timestamp + "_difftac"
+    if use_structured_tactile:
+        ckpt_dir = ckpt_dir + "_structac"
+        timestamp = timestamp + "_structac"
 
 
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -162,6 +173,7 @@ def main(args):
                          'camera_names': camera_names,
                          'use_tactile': use_tactile,
                          'use_differential_tactile': use_differential_tactile,
+                         'use_structured_tactile': use_structured_tactile,
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
@@ -185,6 +197,7 @@ def main(args):
         # 'real_robot': not is_sim,
         'use_tactile': use_tactile,
         'use_differential_tactile': use_differential_tactile,
+        'use_structured_tactile': use_structured_tactile,
         'resume_path': resume_path,
         'use_swanlab':             use_swanlab,
         'swanlab_project':         args.get('swanlab_project', 'ViTacFormer-DTC'),
@@ -484,6 +497,8 @@ if __name__ == '__main__':
     parser.add_argument('--temporal_agg', action='store_true')
     parser.add_argument('--use_tactile', action='store_true')
     parser.add_argument('--use_differential_tactile', action='store_true')
+    parser.add_argument('--use_structured_tactile', action='store_true',
+                        help='Enable structured dual tactile token (t^s + t^dyn) representation')
     parser.add_argument('--resume_path', type=str, default=None, help='path to resume checkpoint')
     parser.add_argument('--use_swanlab', action='store_true')
     parser.add_argument('--swanlab_project', type=str, default='ViTacFormer-DTC', help='SwanLab project name')

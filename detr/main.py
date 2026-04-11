@@ -68,6 +68,8 @@ def get_args_parser():
 
     parser.add_argument('--use_tactile', action='store_true')
     parser.add_argument('--use_differential_tactile', action='store_true')
+    parser.add_argument('--use_structured_tactile', action='store_true',
+                        help='Enable structured dual tactile token (t^s + t^dyn) representation')
 
     parser.add_argument('--resume_path', type=str, default=None, help='path to resume checkpoint')
 
