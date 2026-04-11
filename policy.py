@@ -15,14 +15,16 @@ class ACTPolicy(nn.Module):
         self.model = model # CVAE decoder
         self.optimizer = optimizer
         self.kl_weight = args_override['kl_weight']
+        # Cache scalar so access survives DDP wrapping of self.model.
+        self.num_queries = model.num_queries
         print(f'KL Weight {self.kl_weight}')
 
 
     def __call__(self, qpos, image, actions=None, is_pad=None, device=None, tactile=None, tactile_next=None, epoch=0):
         env_state = None
         if actions is not None: # training time
-            actions = actions[:, :self.model.num_queries]
-            is_pad = is_pad[:, :self.model.num_queries]
+            actions = actions[:, :self.num_queries]
+            is_pad = is_pad[:, :self.num_queries]
 
             if device is None:
                 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

@@ -1,0 +1,419 @@
+\documentclass[11pt]{article}
+\usepackage[UTF8]{ctex}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue,citecolor=blue}
+
+\title{长时精细灵巧操作中的微分触觉控制：\\
+更新版方法主线与结构蓝图}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{文档目的}
+
+本文档用于对当前方法主线进行一次收束式更新。目标不是给出最终定稿的方法，而是在已有讨论基础上，将真正应当保留的核心命题、模块分工、结构设计与实验蓝图整理成一版更统一、更贴近 CoRL 论文叙事的 \LaTeX{} 草稿。
+
+本文档重点解决两个问题：
+\begin{itemize}[leftmargin=2em]
+    \item 如何避免方法退化为“又一个普通的视觉--触觉融合网络”；
+    \item 如何避免方法被理解为显式的 slow-fast hierarchical policy，同时仍然保留长时主线与关键窗口的双时间尺度特征。
+\end{itemize}
+
+因此，本文档强调的不是单个模块的复杂性，而是\textbf{整条主线的结构一致性}。
+
+\section{核心问题与基本判断}
+
+我们要解决的，不是一个简单的“视觉和触觉如何融合”的问题，而是一个更深层的结构性矛盾：
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{长时任务要求一致性（consistency）}：系统必须在较长的时间尺度上保持任务主线，知道任务现在推进到哪一步，不能因为局部噪声或短时波动而频繁偏航；
+    \item \textbf{精细控制要求敏感性（responsiveness）}：系统必须对极短但决定成败的局部接触变化保持高度敏感，例如插入最后几毫米、旋拧刚刚咬牙、卡扣闭合瞬间、柔性件边缘刚刚搭上等。
+\end{itemize}
+
+因此，长时精细操作并不是单纯的长序列控制问题，而更像是：
+\[
+\text{长时任务主线} + \text{若干短时关键精细接触窗口}.
+\]
+
+现有许多视觉--触觉方法已经证明：触觉对接触密集型任务非常重要；但它们通常仍然把触觉视为“另一种观测模态”，或者仅仅在策略层面引入快慢结构，而没有显式回答以下更关键的问题：
+
+\begin{quote}
+在长时精细操作中，\textbf{哪些触觉信息应当被保留下来以维持主线，哪些触觉信息应当被强调以驱动关键窗口中的局部动作修正？}
+\end{quote}
+
+本文档的基本判断是：\textbf{raw tactile 本身并不是最理想的控制变量。}更合适的做法，是将触觉改写为一组具有明确控制语义的结构化变量，并让视觉在当前交互条件下被选择性调用，而不是被动地全量吞入。
+
+\section{主线命题}
+
+本文档建议的总主线可以概括为：
+
+\begin{quote}
+\textbf{长时精细灵巧操作的关键，不是 raw tactile，而是接触状态、接触动态与接触异常；视觉的作用不是与触觉逐点对齐，而是在当前交互条件下提供最相关的上下文；控制主体不是显式高低层分解，而是统一交互状态中的双时间尺度动力学。}
+\end{quote}
+
+更明确地说，本文档建议将原始触觉信号 $x_t$ 经编码后组织为：
+\[
+x_t \xrightarrow{\phi} h_t \rightarrow (s_t,\; v_t,\; r_t),
+\]
+其中
+\begin{itemize}[leftmargin=2em]
+    \item $s_t$：\textbf{contact state}，表示接触主线、稳态接触分布、阶段推进与持续接触格局；
+    \item $v_t$：\textbf{contact dynamics}，表示接触如何变化，例如接触建立、滑移 onset、受力恶化、对齐改善或恶化；
+    \item $r_t$：\textbf{contact irregularity}，表示相对稳态接触无法解释的局部异常，例如 stick-slip、微振动、瞬时 burst 与局部不稳定。
+\end{itemize}
+
+与其把触觉视作一个单一模态，不如把它视作一个\textbf{具有控制语义的微分接触结构}。在这个视角下：
+\begin{itemize}[leftmargin=2em]
+    \item 长时任务主线更依赖 $s_t$；
+    \item 关键精细窗口更依赖 $v_t$ 与 $r_t$；
+    \item 视觉的作用不是直接和触觉一一对应，而是提供\textbf{当前交互最相关的上下文与几何线索}。
+\end{itemize}
+
+\section{更新版方法总览}
+
+本文档当前最推荐的方法框架由三个核心主模块和一个分层输出模块组成：
+
+\begin{enumerate}[leftmargin=2.2em,label=\textbf{模块 \arabic*.}]
+    \item \textbf{Differential Tactile Encoder}：将 raw tactile 重写为 $s_t,v_t,r_t$；
+    \item \textbf{Interaction-Conditioned Context Selection}：根据当前交互状态，从视觉中选择最相关上下文，而不做脆弱的硬空间对齐；
+    \item \textbf{Unified Interaction State Backbone}：在统一交互状态中建模任务主线与关键窗口的双时间尺度动力学；
+    \item \textbf{Mainline--Refinement Output Heads}：由主线动作头输出长时一致性动作，由窗口修正头输出关键接触窗口中的局部动作修正，并通过窗口强度进行融合。
+\end{enumerate}
+
+这个版本的方法主线刻意避免把系统写成显式的高层/低层 policy 分层。我们强调的是：\textbf{同一个统一系统内部存在不同时间尺度的状态演化与输出机制。}
+
+\section{模块一：Differential Tactile Encoder}
+
+\subsection{动机}
+
+如果直接把 raw tactile 作为输入，模型需要自己从高频、局部、噪声敏感的触觉流中学习哪些信息值得长期保存，哪些信息只该在局部瞬时发挥作用。这个学习难度很高，也不利于形成清晰的结构归纳偏置。
+
+因此，我们建议先用一个触觉编码器将原始触觉变成中间表示：
+\[
+h_t = \phi(x_t),
+\]
+再在特征空间上构造：
+\[
+s_t = \mathrm{Smooth}(h_t), \qquad
+v_t = h_t - h_{t-1}, \qquad
+r_t = h_t - s_t.
+\]
+
+\subsection{三类量的含义}
+
+\paragraph{Contact State $s_t$.}
+它代表接触的慢变化部分，负责表达“当前处在什么接触状态”。典型语义包括：是否已经建立稳定接触、接触是否持续、压力分布是否基本成形、当前是否已经进入某个稳态接触阶段等。它更适合支撑长时任务主线。
+
+\paragraph{Contact Dynamics $v_t$.}
+它代表接触在如何变化。它不关心“现在压力有多大”，而更关心“现在接触是在上升、下降、突变还是翻转”。它特别适合描述滑移 onset、边缘擦碰、接触建立、对齐改善/恶化等现象，是关键窗口中局部动作修正的核心动态量。
+
+\paragraph{Contact Irregularity $r_t$.}
+它代表无法被平滑状态解释掉的局部异常部分。它适合描述微振动、stick-slip、局部 burst、瞬时异常、局部噪声中真正具有控制意义的高频成分。
+
+\subsection{可能的增强方向}
+
+本文档建议保留以下扩展方向作为后续增强项，而不一定在第一版就全部加入：
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Directional Derivatives}：把导数再拆成法向、切向、旋转相关部分：
+    \[
+    v_t = [v_t^n,\; v_t^\tau,\; v_t^\omega].
+    \]
+    \item \textbf{Cross-Finger Coupling}：分析不同手指之间的导数关系：
+    \[
+    \Delta v_t^{i,j} = v_t^i - v_t^j,
+    \]
+    以捕捉多指协同接触的相对变化。
+\end{itemize}
+
+\section{模块二：Interaction-Conditioned Context Selection}
+
+\subsection{为什么不做硬空间绑定}
+
+对于灵巧手系统，尤其是长时任务、频繁遮挡、多视角变化以及真实系统误差存在时，要求把每个触觉单元或每个 taxel 精确映射到图像空间，通常既不现实，也很脆弱。因此，本文档明确放弃“严格视觉--触觉空间硬对齐”的路线。
+
+另一方面，直接做全局拼接（naive fusion）或全局 cross-attention 也不够理想。因为在长时精细操作中，视觉并不是始终 equally useful；不同阶段、不同交互条件下，真正相关的视觉信息其实是随任务过程变化的。
+
+\subsection{核心思想}
+
+我们建议让当前交互状态去\textbf{选择}视觉上下文，而不是被动地吞入全部视觉特征。为此，构造一个 \emph{interaction-conditioned query}：
+\[
+c_t = f_c(q_t,\; a_{t-1},\; s_t,\; v_t,\; r_t),
+\]
+其中
+\begin{itemize}[leftmargin=2em]
+    \item $q_t$：本体感觉（关节、末端状态、手部姿态等）；
+    \item $a_{t-1}$：动作历史或上一时刻控制上下文；
+    \item $s_t,v_t,r_t$：结构化触觉表示。
+\end{itemize}
+
+视觉分支先编码得到视觉上下文池：
+\[
+V_t = \psi(I_t),
+\]
+然后用 $c_t$ 去选择与检索当前最相关的视觉上下文：
+\[
+\tilde V_t = \mathrm{Retrieve}(V_t,\; c_t).
+\]
+
+这里的 $\tilde V_t$ 不是“整张图的表示”，而是：
+\begin{quote}
+当前这次交互最需要参考的视觉上下文。
+\end{quote}
+
+\subsection{这个模块的意义}
+
+这样做的意义在于，视觉不再是固定背景，也不需要和触觉严格一一对应，而是根据当前交互条件被动态调用。于是，视觉和触觉的关系从“空间硬绑定”转为“交互条件下的上下文关联”。
+
+\section{模块三：Unified Interaction State Backbone}
+
+\subsection{核心目标}
+
+这一模块要直接解决文章最重要的矛盾：
+
+\begin{center}
+\textbf{长时主线的一致性} \quad \textbf{vs.} \quad \textbf{关键窗口中的局部动作分布建模}.
+\end{center}
+
+因此，我们建议维护一个\textbf{统一交互状态系统}，并在其中引入不同时间尺度的状态动力学，而不是使用显式的高层 policy / 低层 policy 分层。
+
+\subsection{状态定义}
+
+定义两个状态通道：
+\[
+z_t^{main}, \qquad z_t^{win},
+\]
+分别表示：
+
+\paragraph{Mainline State $z_t^{main}$.}
+它负责维持任务主线、阶段推进、粗粒度意图与接触整体稳定性。它应该是平滑、稳定、抗噪的。
+
+\paragraph{Window State $z_t^{win}$.}
+它负责描述当前是否进入关键精细接触窗口，以及窗口中的局部接触变化趋势与异常反应。它应该更快、更敏感、更局部。
+
+\subsection{状态更新}
+
+建议采用双时间尺度更新：
+\[
+z_{t+1}^{main} = A_m z_t^{main} + B_m [\tilde V_t,\; q_t,\; s_t],
+\]
+\[
+z_{t+1}^{win} = A_w(\omega_t) z_t^{win} + B_w(\omega_t) [\tilde V_t,\; q_t,\; v_t,\; r_t].
+\]
+
+这里，主线状态主要吸收：
+\begin{itemize}[leftmargin=2em]
+    \item 检索得到的视觉上下文 $\tilde V_t$；
+    \item 本体感觉 $q_t$；
+    \item 接触状态 $s_t$。
+\end{itemize}
+
+窗口状态主要吸收：
+\begin{itemize}[leftmargin=2em]
+    \item 检索得到的视觉上下文 $\tilde V_t$；
+    \item 本体感觉 $q_t$；
+    \item 接触动态 $v_t$；
+    \item 接触异常 $r_t$。
+\end{itemize}
+
+\subsection{窗口强度 $\omega_t$}
+
+定义一个 precision-window intensity：
+\[
+\omega_t = f_\omega(v_t,\; r_t,\; q_t,\; z_t^{main}),
+\]
+表示当前是否处于关键精细窗口，或者当前局部交互的重要程度有多高。
+
+直观理解：
+\begin{itemize}[leftmargin=2em]
+    \item 当接触平稳、导数较小、异常不明显时，$\omega_t$ 应较小，系统主要依赖主线状态；
+    \item 当导数突然上升、残差异常增强，并且任务阶段进入某个关键接触区间时，$\omega_t$ 应较大，窗口状态应更快更新并更强地主导局部控制。
+\end{itemize}
+
+\subsection{这个结构的美感}
+
+这个设计最核心的价值在于：它不是土味的“高层管规划，低层管控制”，而是在一个统一系统中显式地建模：
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{长时主线}：稳定而持续；
+    \item \textbf{关键窗口}：短暂但高权重；
+    \item \textbf{状态分工}：$s_t$ 维持主线，$v_t,r_t$ 驱动局部修正。
+\end{itemize}
+
+\section{控制输出：Mainline Action + Window Refinement}
+
+最终控制不建议仅输出一个统一动作。因为精细接触任务不只是“往哪里动”，还包括“在关键窗口里如何做局部微调”。
+
+因此建议输出两级动作：
+\[
+u_t^{main} = f_m(z_t^{main}),
+\]
+\[
+\Delta u_t = f_{ref}(z_t^{win},\; \tilde V_t,\; q_t,\; v_t,\; r_t),
+\]
+\[
+\kappa_t = f_\kappa(z_t^{main}, z_t^{win}).
+\]
+
+其中：
+\begin{itemize}[leftmargin=2em]
+    \item $u_t^{main}$：任务主线动作；
+    \item $\Delta u_t$：关键窗口中的局部动作修正；
+    \item $\kappa_t$：接触控制参数，例如 stiffness、damping、grip adjustment、compliance mode 等。
+\end{itemize}
+
+最终组合控制为：
+\[
+u_t = u_t^{main} + \omega_t \cdot \Delta u_t,
+\]
+\[
+a_t = \mathcal{C}(u_t,\kappa_t).
+\]
+
+这样，系统平时由主线状态主导；一旦进入关键窗口，窗口状态通过修正头对控制的影响自动增强。
+
+\subsection{一个自然的增强方向}
+
+在更强的版本中，窗口修正头 $f_{ref}$ 可以进一步参数化为条件 flow model：
+\[
+\Delta u_t \sim p_\theta(\Delta u_t \mid z_t^{win},\; \tilde V_t,\; q_t,\; v_t,\; r_t),
+\]
+从而更好地建模关键精细窗口中的局部动作分布。但本文档当前主线不依赖这一扩展，它仅作为后续增强方向保留。
+
+\section{训练目标的基本思路}
+
+本文档建议训练目标至少包含以下几部分：
+
+\subsection{主控制损失}
+\[
+\mathcal{L}_{ctrl}
+=
+\|u_t-u_t^\*\|_1 + \|\kappa_t-\kappa_t^\*\|_1.
+\]
+
+\subsection{主线平滑损失}
+\[
+\mathcal{L}_{main}
+=
+(1-\omega_t)\cdot \|z_{t+1}^{main} - z_t^{main}\|_2^2.
+\]
+
+\subsection{窗口修正损失}
+\[
+\mathcal{L}_{ref}
+=
+\omega_t \cdot \mathcal{D}(\Delta u_t,\; \Delta u_t^\*),
+\]
+其中 $\mathcal{D}$ 可以是局部动作误差、局部动作分布匹配损失，或对接触动态的预测误差。
+
+\subsection{平衡损失}
+为了防止系统在非关键窗口里过度激活修正分支：
+\[
+\mathcal{L}_{balance}
+=
+(1-\omega_t)\cdot \|\Delta u_t\|_2^2.
+\]
+
+整体训练目标可写为：
+\[
+\mathcal{L}
+=
+\mathcal{L}_{ctrl}
++ \lambda_1 \mathcal{L}_{main}
++ \lambda_2 \mathcal{L}_{ref}
++ \lambda_3 \mathcal{L}_{balance}.
+\]
+
+\section{与现有工作的区别}
+
+本文档建议在论文中将区别概括为以下三点：
+
+\begin{enumerate}[leftmargin=2.2em]
+    \item \textbf{与显式 slow-fast hierarchical policy 的区别}：我们不将系统拆解为高层规划器和低层修正器，而是在统一交互状态中引入不同时间尺度的状态动力学，并通过接触状态、接触动态与接触异常的结构化表示来区分主线与窗口；
+    \item \textbf{与统一多模态 token 融合的区别}：我们不依赖全局 token 拼接或 brittle spatial alignment，而采用 interaction-conditioned context selection，让视觉在当前交互条件下被动态调用；
+    \item \textbf{与单纯频率感知融合的区别}：我们不是简单区分高频和低频，而是赋予三类触觉量明确的控制语义，并使其在主线状态与窗口修正中承担不同角色。
+\end{enumerate}
+
+\section{实验设计蓝图}
+
+本文档建议实验设计围绕“主线”和“窗口”两个层面展开。
+
+\subsection{任务类型}
+
+\paragraph{短时精细任务} 用于验证 $v_t,r_t$ 与窗口修正头的作用，例如：
+\begin{itemize}[leftmargin=2em]
+    \item 插接
+    \item 旋拧
+    \item 卡扣闭合
+    \item 曲面擦拭
+\end{itemize}
+
+\paragraph{组合式长时任务} 用于验证 $s_t$ 和统一交互状态，例如：
+\begin{itemize}[leftmargin=2em]
+    \item 取物 $\rightarrow$ 对齐 $\rightarrow$ 插入 $\rightarrow$ 旋紧
+    \item 双手稳定抓持 $\rightarrow$ 单手局部操作
+    \item 多阶段装配
+\end{itemize}
+
+\subsection{评测指标}
+
+建议同时报告两类指标：
+
+\paragraph{主线指标}
+\begin{itemize}[leftmargin=2em]
+    \item 长时任务完成率
+    \item phase / progress 预测一致性
+    \item 动作漂移程度
+\end{itemize}
+
+\paragraph{窗口指标}
+\begin{itemize}[leftmargin=2em]
+    \item 关键精细窗口成功率
+    \item 局部恢复能力
+    \item 导数 spike 后的响应延迟
+    \item 非关键窗口中的过度反应率
+\end{itemize}
+
+\subsection{核心消融}
+
+建议至少做以下消融：
+\begin{itemize}[leftmargin=2em]
+    \item raw tactile 直接融合；
+    \item 去掉 $v_t$；
+    \item 去掉 $r_t$；
+    \item 去掉 interaction-conditioned context selection；
+    \item 去掉统一交互状态中的窗口通道，仅保留单一状态；
+    \item 去掉 $\omega_t$；
+    \item 将窗口修正头替换为简单线性头，而非条件分布建模头。
+\end{itemize}
+
+\section{一句话式的方法总结}
+
+如果要用一句最简洁的话概括本文档当前的方法主线，可以写成：
+
+\begin{quote}
+\textbf{我们将长时精细灵巧操作建模为任务主线与关键接触窗口共同驱动的统一交互过程，并通过接触状态、接触动态与接触异常的结构化触觉表示，以及交互条件视觉上下文选择和统一交互状态骨干，实现长时一致性与局部精细响应性的协调。}
+\end{quote}
+
+\section{当前最推荐的工作标题}
+
+当前最推荐的标题方向有两个：
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Differential Tactile Control for Long-Horizon Dexterous Manipulation}
+    \item \textbf{Contact State and Tactile Derivatives for Long-Horizon Dexterity}
+\end{itemize}
+
+前者更强调方法气质，后者更强调核心变量。
+
+\section{结语}
+
+本文档当前最重要的价值，不在于每个模块都已经定型，而在于已经形成了一条相对清晰的主线：\textbf{不是再做一个普通的视觉--触觉融合网络，也不是做一个显式的高低层快慢 policy，而是在统一交互状态中写入长时主线与关键窗口的矛盾，并把触觉从原始模态改写成接触状态与接触变化，再让视觉在交互条件下被动态调用。} 这条主线既有足够清楚的控制意义，也具备继续扩展成正式 CoRL 论文的潜力。
+
+\end{document}

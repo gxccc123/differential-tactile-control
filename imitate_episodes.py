@@ -16,6 +16,9 @@ from dataset.ha_pipelinev2_dataset import HaPipelineV2DatasetD020
 from dataset.data import data
 from dataset.data_tactile import data_tactile
 from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
 from tqdm import tqdm, trange
 
@@ -114,7 +117,91 @@ def finish_swanlab_run(run):
     print('[SwanLab] Run finished.')
 
 
+# ── DDP helpers ───────────────────────────────────────────────────────────────
+
+def setup_ddp(local_rank: int) -> None:
+    """Initialise the default process group and pin this process to local_rank."""
+    dist.init_process_group(backend='nccl')
+    torch.cuda.set_device(local_rank)
+
+
+def cleanup_ddp() -> None:
+    """Destroy the process group if it was initialised."""
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _get_saveable_state_dict(policy) -> dict:
+    """
+    Return a state dict in the same key format as a non-DDP policy.state_dict()
+    (i.e. keys are 'model.xxx', never 'model.module.xxx').
+
+    This ensures checkpoints saved under DDP can be loaded identically into a
+    single-GPU policy without any key renaming.
+    """
+    if isinstance(policy.model, DDP):
+        raw_sd = policy.model.module.state_dict()
+        return {'model.' + k: v for k, v in raw_sd.items()}
+    return policy.state_dict()
+
+
+def _load_state_dict_into_policy(policy, state_dict: dict) -> None:
+    """
+    Load a state dict (in 'model.xxx' format) into the policy, transparently
+    handling the case where policy.model is wrapped with DDP.
+    """
+    if isinstance(policy.model, DDP):
+        model_sd = {k[len('model.'):]: v
+                    for k, v in state_dict.items()
+                    if k.startswith('model.')}
+        policy.model.module.load_state_dict(model_sd)
+    else:
+        policy.load_state_dict(state_dict)
+
+
+def _build_optimizer_from_config(policy_config: dict, model) -> torch.optim.Optimizer:
+    """
+    Rebuild an AdamW optimizer that explicitly references model.parameters().
+
+    Called after DDP wrapping so the optimizer's param_groups point to the
+    DDP-wrapped module's parameters (same underlying tensors, but registered
+    through DDP).  The backbone/non-backbone split and hyperparameters mirror
+    those in detr/main.py build_ACT_model_and_optimizer().
+    """
+    param_dicts = [
+        {
+            "params": [p for n, p in model.named_parameters()
+                       if "backbone" not in n and p.requires_grad],
+        },
+        {
+            "params": [p for n, p in model.named_parameters()
+                       if "backbone" in n and p.requires_grad],
+            "lr": policy_config['lr_backbone'],
+        },
+    ]
+    return torch.optim.AdamW(
+        param_dicts,
+        lr=policy_config['lr'],
+        weight_decay=1e-4,
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def main(args):
+    # ── DDP detection ─────────────────────────────────────────────────────────
+    # torchrun injects LOCAL_RANK / RANK / WORLD_SIZE into the environment.
+    # When running with plain `python` (single GPU), these are absent and we
+    # fall back to 0 / 0 / 1 so the entire code path stays identical.
+    local_rank  = int(os.environ.get('LOCAL_RANK', 0))
+    rank        = int(os.environ.get('RANK',       0))
+    world_size  = int(os.environ.get('WORLD_SIZE', 1))
+    is_main     = (rank == 0)
+    use_ddp     = (world_size > 1)
+
+    if use_ddp:
+        setup_ddp(local_rank)
+
     set_seed(1)
     # command line parameters
     is_eval = args['eval']
@@ -146,8 +233,12 @@ def main(args):
         ckpt_dir = ckpt_dir + "_structac"
         timestamp = timestamp + "_structac"
 
-
-    os.makedirs(ckpt_dir, exist_ok=True)
+    # Only rank 0 creates the checkpoint directory.
+    # barrier() ensures all other ranks wait until the directory exists.
+    if is_main:
+        os.makedirs(ckpt_dir, exist_ok=True)
+    if use_ddp:
+        dist.barrier()
 
     episode_len = 10000
     camera_names = ['/observe/vision/head/stereo/lefteye/rgb','/observe/vision/head/stereo/righteye/rgb','/observe/vision/right_wrist/fisheye/rgb','/observe/vision/left_wrist/fisheye/rgb']
@@ -222,37 +313,54 @@ def main(args):
     data_tactile['val']['norm_stats_cache'] = norm_stats_cache
 
 
+    # Every rank builds the dataset independently (same data, DistributedSampler
+    # ensures non-overlapping subsets per rank).
     if not use_tactile:
         train_dataset = HaPipelineV2DatasetD020(**data['train'])
-        train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=False, num_workers=36, prefetch_factor=1)
-
-        # val_dataset = HaPipelineV2DatasetD020(**data['val'])
-        # val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=False, num_workers=36, prefetch_factor=1)
     else:
         train_dataset = HaPipelineV2DatasetD020(**data_tactile['train'])
-        train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=False, num_workers=36, prefetch_factor=1)
 
-        # val_dataset = HaPipelineV2DatasetD020(**data_tactile['val'])
-        # val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=False, num_workers=36, prefetch_factor=1)
+    if use_ddp:
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=rank, shuffle=True
+        )
+        train_dataloader = DataLoader(
+            train_dataset, batch_size=batch_size_train,
+            sampler=train_sampler, shuffle=False,
+            pin_memory=False, num_workers=36, prefetch_factor=1,
+        )
+    else:
+        train_sampler = None
+        train_dataloader = DataLoader(
+            train_dataset, batch_size=batch_size_train, shuffle=True,
+            pin_memory=False, num_workers=36, prefetch_factor=1,
+        )
 
+    # All ranks compute the normalizer (same result); only rank 0 saves it.
     normalizer = train_dataset.get_normalizer()
 
+    if is_main:
+        stats_path = os.path.join(ckpt_dir, 'normalize.pkl')
+        with open(stats_path, 'wb') as f:
+            pickle.dump(normalizer, f)
+    # Wait until normalize.pkl is visible to all processes before continuing.
+    if use_ddp:
+        dist.barrier()
 
+    best_ckpt_info = train_bc(train_dataloader, normalizer, train_dataset,
+                               timestamp, config,
+                               rank=rank, local_rank=local_rank,
+                               world_size=world_size, train_sampler=train_sampler)
 
-    # save dataset stats
-    if not os.path.isdir(ckpt_dir):
-        os.makedirs(ckpt_dir)
-    stats_path = os.path.join(ckpt_dir, f'normalize.pkl')
-    with open(stats_path, 'wb') as f:
-        pickle.dump(normalizer, f)
+    # Only rank 0 saves the final best checkpoint.
+    if is_main:
+        best_epoch, best_loss, best_state_dict = best_ckpt_info
+        ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
+        torch.save(best_state_dict, ckpt_path)
+        print(f'Best ckpt, loss {best_loss:.6f} @ epoch{best_epoch}')
 
-    best_ckpt_info = train_bc(train_dataloader, normalizer, train_dataset, timestamp, config)
-    best_epoch, best_loss, best_state_dict = best_ckpt_info
-
-    # save best checkpoint
-    ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
-    torch.save(best_state_dict, ckpt_path)
-    print(f'Best ckpt, loss {best_loss:.6f} @ epoch{best_epoch}')
+    if use_ddp:
+        cleanup_ddp()
 
 
 def make_policy(policy_class, policy_config):
@@ -318,34 +426,50 @@ def forward_pass(data, policy, normalizer, device, use_tactile, epoch=0):
     return policy(qpos_data_norm, image_data, action_data_norm, is_pad, device)
 
 
-def train_bc(train_dataloader, normalizer, dataset, timestamp, config):
-    num_epochs = config['num_epochs']
-    ckpt_dir = config['ckpt_dir']
-    seed = config['seed']
-    policy_class = config['policy_class']
-    policy_config = config['policy_config']
-    use_tactile = config['use_tactile']
-    resume_path = config.get('resume_path', None)
+def train_bc(train_dataloader, normalizer, dataset, timestamp, config,
+             rank=0, local_rank=0, world_size=1, train_sampler=None):
+    num_epochs     = config['num_epochs']
+    ckpt_dir       = config['ckpt_dir']
+    seed           = config['seed']
+    policy_class   = config['policy_class']
+    policy_config  = config['policy_config']
+    use_tactile    = config['use_tactile']
+    resume_path    = config.get('resume_path', None)
     swanlab_log_interval = max(1, config.get('swanlab_log_interval', 10))
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    use_ddp = (world_size > 1)
+    is_main = (rank == 0)
+
+    # Each DDP rank binds to its own GPU; single-GPU falls back to cuda/cpu.
+    device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available()
+                          else 'cpu')
 
     set_seed(seed)
 
-    start_epoch = 0
-    global_step = 0
-    best_loss = np.inf
+    start_epoch  = 0
+    global_step  = 0
+    best_loss    = np.inf
     best_ckpt_info = None
 
     from transformers import get_cosine_schedule_with_warmup
 
+    # ── Build policy ──────────────────────────────────────────────────────────
     policy = make_policy(policy_class, policy_config)
     policy.to(device)
-    optimizer = make_optimizer(policy_class, policy)
 
-    # === 构建 scheduler ===
+    if use_ddp:
+        # Wrap the inner DETRVAE model with DDP.
+        # find_unused_parameters=True is required because DETRVAE has conditional
+        # branches (CVAE encoder, tactile_pred head) that may not participate in
+        # every forward pass, leaving some parameters without gradients.
+        policy.model = DDP(policy.model, device_ids=[local_rank],
+                           find_unused_parameters=True)
+        optimizer = _build_optimizer_from_config(policy_config, policy.model)
+    else:
+        optimizer = make_optimizer(policy_class, policy)
+
+    # ── Scheduler ─────────────────────────────────────────────────────────────
     total_iters = num_epochs * len(train_dataloader)
-
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=config['lr_config']['warmup_iters'],
@@ -353,62 +477,76 @@ def train_bc(train_dataloader, normalizer, dataset, timestamp, config):
     )
 
     train_history = []
-    global_step = 0
-    best_loss = np.inf
-    best_ckpt_info = None
 
-    swanlab_run = init_swanlab_run(config, timestamp)
+    # ── SwanLab (rank 0 only) ─────────────────────────────────────────────────
+    swanlab_run = init_swanlab_run(config, timestamp) if is_main else None
 
-    log_swanlab_metrics(swanlab_run, {
-        'meta/train_dataset_size': len(train_dataloader.dataset),
-        'meta/train_num_batches':  len(train_dataloader),
-        'meta/batch_size':         train_dataloader.batch_size,
-    })
+    if is_main:
+        log_swanlab_metrics(swanlab_run, {
+            'meta/train_dataset_size': len(train_dataloader.dataset),
+            'meta/train_num_batches':  len(train_dataloader),
+            'meta/batch_size':         train_dataloader.batch_size,
+            'meta/world_size':         world_size,
+        })
 
-    # === resume ===
+    # ── Resume ────────────────────────────────────────────────────────────────
+    # All ranks load the same checkpoint to keep model weights in sync.
     if resume_path is not None and os.path.exists(resume_path):
-        print(f"[Resume] Loading checkpoint from {resume_path}")
+        if is_main:
+            print(f"[Resume] Loading checkpoint from {resume_path}")
         checkpoint = torch.load(resume_path, map_location=device)
-        policy.load_state_dict(checkpoint['model'])
+        _load_state_dict_into_policy(policy, checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         if 'scheduler' in checkpoint:
             scheduler.load_state_dict(checkpoint['scheduler'])
         start_epoch = checkpoint.get('epoch', 0)
         global_step = checkpoint.get('global_step', 0)
-        best_loss = checkpoint.get('best_loss', checkpoint.get('min_val_loss', np.inf))
+        best_loss   = checkpoint.get('best_loss',
+                                     checkpoint.get('min_val_loss', np.inf))
         best_ckpt_info = checkpoint.get('best_ckpt_info', None)
 
+    # ── Training loop ─────────────────────────────────────────────────────────
     try:
-        for epoch in tqdm(range(start_epoch, num_epochs)):
-            print(f'\nEpoch {epoch}')
+        epoch_iter = tqdm(range(start_epoch, num_epochs), disable=not is_main)
+        for epoch in epoch_iter:
 
-            # training
+            # DistributedSampler must be re-seeded each epoch so that
+            # different GPUs see different shuffles across epochs.
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+
+            if is_main:
+                print(f'\nEpoch {epoch}')
+
             policy.train()
             optimizer.zero_grad()
             epoch_history = []
-            with tqdm(train_dataloader, desc=f"Train Epoch {epoch}", leave=False) as tepoch:
-                for _, data in enumerate(tepoch):
-                    data = dataset.postprocess(data, device, use_tactile)
-                    forward_dict = forward_pass(data, policy, normalizer, device, use_tactile, epoch)
-                    loss = forward_dict['loss']
-                    loss.backward()
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
 
-                    detached = detach_dict(forward_dict)
-                    epoch_history.append(detached)
-                    train_history.append(detached)
+            batch_iter = tqdm(train_dataloader,
+                              desc=f"Train Epoch {epoch}", leave=False,
+                              disable=not is_main)
+            for _, data in enumerate(batch_iter):
+                data = dataset.postprocess(data, device, use_tactile)
+                forward_dict = forward_pass(data, policy, normalizer,
+                                            device, use_tactile, epoch)
+                loss = forward_dict['loss']
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
 
+                detached = detach_dict(forward_dict)
+                epoch_history.append(detached)
+                train_history.append(detached)
+                global_step += 1
+
+                if is_main:
                     current_lr = optimizer.param_groups[0]['lr']
-                    tepoch.set_postfix(
+                    batch_iter.set_postfix(
                         loss=loss.item(),
                         lr=f"{current_lr:.2e}",
-                        refresh=False
+                        refresh=False,
                     )
-
-                    global_step += 1
-
                     if global_step % swanlab_log_interval == 0:
                         step_metrics = {
                             f'train/step_{k}': v for k, v in detached.items()
@@ -420,59 +558,74 @@ def train_bc(train_dataloader, normalizer, dataset, timestamp, config):
                         })
                         log_swanlab_metrics(swanlab_run, step_metrics)
 
-            epoch_summary = compute_dict_mean(epoch_history)
-            epoch_train_loss = epoch_summary['loss']
-            print(f'Train loss: {epoch_train_loss:.5f}')
+            # ── Epoch-end (rank 0 only for logging and saving) ────────────────
+            if is_main:
+                epoch_summary     = compute_dict_mean(epoch_history)
+                epoch_train_loss  = epoch_summary['loss']
+                print(f'Train loss: {epoch_train_loss:.5f}')
+                summary_string = ''.join(
+                    f'{k}: {v.item():.3f} ' for k, v in epoch_summary.items()
+                )
+                print(summary_string)
 
-            summary_string = ''
-            for k, v in epoch_summary.items():
-                summary_string += f'{k}: {v.item():.3f} '
-            print(summary_string)
+                if epoch_train_loss < best_loss:
+                    best_loss = epoch_train_loss
+                    # _get_saveable_state_dict strips the DDP 'module.' prefix
+                    # so the saved checkpoint is loadable without DDP.
+                    best_ckpt_info = (epoch, best_loss,
+                                      deepcopy(_get_saveable_state_dict(policy)))
 
-            if epoch_train_loss < best_loss:
-                best_loss = epoch_train_loss
-                best_ckpt_info = (epoch, best_loss, deepcopy(policy.state_dict()))
-
-            epoch_metrics = {
-                f'train/epoch_{k}': v for k, v in epoch_summary.items()
-            }
-            epoch_metrics.update({
-                'train/epoch':       epoch,
-                'train/global_step': global_step,
-                'train/lr':          optimizer.param_groups[0]['lr'],
-                'train/best_loss':   best_loss,
-            })
-            log_swanlab_metrics(swanlab_run, epoch_metrics)
-
-            if epoch % 5 == 0:
-                ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_loss_{epoch_train_loss:.3f}.ckpt')
-                torch.save({
-                    'model':         policy.state_dict(),
-                    'optimizer':     optimizer.state_dict(),
-                    'scheduler':     scheduler.state_dict(),
-                    'epoch':         epoch,
-                    'global_step':   global_step,
-                    'best_loss':     best_loss,
-                    'min_val_loss':  best_loss,
-                    'best_ckpt_info': best_ckpt_info,
-                }, ckpt_path)
-                log_swanlab_metrics(swanlab_run, {
-                    'checkpoint/epoch':     epoch,
-                    'checkpoint/best_loss': best_loss,
+                epoch_metrics = {
+                    f'train/epoch_{k}': v for k, v in epoch_summary.items()
+                }
+                epoch_metrics.update({
+                    'train/epoch':       epoch,
+                    'train/global_step': global_step,
+                    'train/lr':          optimizer.param_groups[0]['lr'],
+                    'train/best_loss':   best_loss,
                 })
+                log_swanlab_metrics(swanlab_run, epoch_metrics)
+
+                if epoch % 5 == 0:
+                    ckpt_path = os.path.join(
+                        ckpt_dir,
+                        f'policy_epoch_{epoch}_loss_{epoch_train_loss:.3f}.ckpt',
+                    )
+                    torch.save({
+                        'model':          _get_saveable_state_dict(policy),
+                        'optimizer':      optimizer.state_dict(),
+                        'scheduler':      scheduler.state_dict(),
+                        'epoch':          epoch,
+                        'global_step':    global_step,
+                        'best_loss':      best_loss,
+                        'min_val_loss':   best_loss,
+                        'best_ckpt_info': best_ckpt_info,
+                    }, ckpt_path)
+                    log_swanlab_metrics(swanlab_run, {
+                        'checkpoint/epoch':     epoch,
+                        'checkpoint/best_loss': best_loss,
+                    })
+
     finally:
-        finish_swanlab_run(swanlab_run)
+        if is_main:
+            finish_swanlab_run(swanlab_run)
 
-    ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
-    torch.save(policy.state_dict(), ckpt_path)
+    # ── Final checkpoints (rank 0 only) ───────────────────────────────────────
+    if is_main:
+        ckpt_path = os.path.join(ckpt_dir, 'policy_last.ckpt')
+        torch.save(_get_saveable_state_dict(policy), ckpt_path)
 
-    if best_ckpt_info is None:
-        best_ckpt_info = (num_epochs - 1, float('inf'), deepcopy(policy.state_dict()))
+        if best_ckpt_info is None:
+            best_ckpt_info = (num_epochs - 1, float('inf'),
+                              deepcopy(_get_saveable_state_dict(policy)))
 
-    best_epoch, best_loss, best_state_dict = best_ckpt_info
-    ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_loss_{best_loss}.ckpt')
-    torch.save(best_state_dict, ckpt_path)
-    print(f'Training finished:\nSeed {seed}, best loss {best_loss:.6f} at epoch {best_epoch}')
+        best_epoch, best_loss, best_state_dict = best_ckpt_info
+        ckpt_path = os.path.join(
+            ckpt_dir, f'policy_epoch_{best_epoch}_loss_{best_loss}.ckpt'
+        )
+        torch.save(best_state_dict, ckpt_path)
+        print(f'Training finished:\nSeed {seed}, best loss {best_loss:.6f} '
+              f'at epoch {best_epoch}')
 
     return best_ckpt_info
 
