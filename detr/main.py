@@ -67,6 +67,9 @@ def get_args_parser():
     parser.add_argument('--ckpt_path', type=str, default=None, help='path to checkpoint')
 
     parser.add_argument('--use_tactile', action='store_true')
+    parser.add_argument('--use_differential_tactile', action='store_true')
+    parser.add_argument('--use_structured_tactile', action='store_true',
+                        help='Enable structured dual tactile token (t^s + t^dyn) representation')
 
     parser.add_argument('--resume_path', type=str, default=None, help='path to resume checkpoint')
 
@@ -75,7 +78,7 @@ def get_args_parser():
 
 def build_ACT_model_and_optimizer(args_override):
     parser = argparse.ArgumentParser('DETR training and evaluation script', parents=[get_args_parser()])
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()  # ignore unknown args (e.g. --use_swanlab) from imitate_episodes
 
     for k, v in args_override.items():
         setattr(args, k, v)

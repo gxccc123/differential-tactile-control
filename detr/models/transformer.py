@@ -46,8 +46,14 @@ class Transformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, src, mask, query_embed, pos_embed, latent_input=None, proprio_input=None, additional_pos_embed=None, tactile=None, tactile_pred=None):
-
+    def forward(self, src, mask, query_embed, pos_embed, latent_input=None, proprio_input=None,
+                additional_pos_embed=None, tactile=None, tactile_pred=None, tactile_dyn=None):
+        """
+        tactile_dyn: [B, D] second tactile token (structured dynamic token). When provided,
+                     n_tactile_tokens is automatically set to 2 and two tactile tokens are
+                     prepended before tactile_pred in the sequence.
+                     Default None → n_tactile_tokens=1 (backward-compatible).
+        """
         if len(src.shape) == 4: # has H and W
             # flatten NxCxHxW to HWxNxC
             bs, c, h, w = src.shape
@@ -62,35 +68,57 @@ class Transformer(nn.Module):
                 addition_input = torch.stack([latent_input, proprio_input], axis=0)
                 src = torch.cat([addition_input, src], axis=0)
                 pred_action = True
+                n_tactile_tokens = 0  # no tactile tokens, unused by encoder
             else:
+                # ── parameterised token layout ─────────────────────────────
+                # n_tactile_tokens tactile tokens, then optional tactile_pred,
+                # then latent, proprio.
+                # pos indices:   [0..n-1] = tactile slots
+                #                [n]      = tactile_pred slot
+                #                [n+1]    = latent slot
+                #                [n+2]    = proprio slot
+                # This is backward-compatible: when n=1 the indices are
+                # [0], [1], [2], [3] – identical to the original hardcoding.
+                n_tactile_tokens = 2 if tactile_dyn is not None else 1
+                pred_pos_idx    = n_tactile_tokens          # e.g. 1 or 2
+                latent_pos_idx  = n_tactile_tokens + 1      # e.g. 2 or 3
+                proprio_pos_idx = n_tactile_tokens + 2      # e.g. 3 or 4
 
-                tokens = [tactile]
-                pos_list = [additional_pos_embed[0]]
+                tac_tokens = [tactile] + ([tactile_dyn] if tactile_dyn is not None else [])
+                tac_pos    = [additional_pos_embed[i] for i in range(n_tactile_tokens)]
+
+                tokens   = tac_tokens[:]
+                pos_list = tac_pos[:]
 
                 if tactile_pred is not None:
                     tokens.append(tactile_pred)
-                    pos_list.append(additional_pos_embed[1])
+                    pos_list.append(additional_pos_embed[pred_pos_idx])
                     pred_action = True
                 else:
                     pred_action = False
 
                 tokens.extend([latent_input, proprio_input])
-                pos_list.extend([additional_pos_embed[2], additional_pos_embed[3]])
+                pos_list.extend([
+                    additional_pos_embed[latent_pos_idx],
+                    additional_pos_embed[proprio_pos_idx],
+                ])
 
-                addition_input = torch.stack(tokens, dim=0)  # [3 + 1, B, D]
-                pos_list = torch.stack(pos_list, dim=0).unsqueeze(1).repeat(1, bs, 1)  # [N_token, B, D]
+                addition_input = torch.stack(tokens, dim=0)
+                pos_list = torch.stack(pos_list, dim=0).unsqueeze(1).repeat(1, bs, 1)
 
-                pos_embed = torch.cat([pos_list, pos_embed], dim=0)  # [3 + 1 + HW, B, D]
-                src = torch.cat([addition_input, src], dim=0)  # [3 + 1 + HW, B, D]
+                pos_embed = torch.cat([pos_list, pos_embed], dim=0)
+                src = torch.cat([addition_input, src], dim=0)
         else:
             assert len(src.shape) == 3
             bs, hw, c = src.shape
             src = src.permute(1, 0, 2)
             pos_embed = pos_embed.unsqueeze(1).repeat(1, bs, 1)
             query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
+            n_tactile_tokens = 0
 
         tgt = torch.zeros_like(query_embed)
-        memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed, pred_action=pred_action)
+        memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed,
+                              pred_action=pred_action, n_tactile_tokens=n_tactile_tokens)
         hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
                           pos=pos_embed, query_pos=query_embed)
         hs = hs.transpose(1, 2)
@@ -107,12 +135,14 @@ class TransformerEncoder(nn.Module):
     def forward(self, src,
                 mask: Optional[Tensor] = None,
                 src_key_padding_mask: Optional[Tensor] = None,
-                pos: Optional[Tensor] = None, pred_action=False):
+                pos: Optional[Tensor] = None, pred_action=False,
+                n_tactile_tokens: int = 1):
         output = src
 
         for layer in self.layers:
             output = layer(output, src_mask=mask,
-                           src_key_padding_mask=src_key_padding_mask, pos=pos, pred_action=pred_action)
+                           src_key_padding_mask=src_key_padding_mask, pos=pos,
+                           pred_action=pred_action, n_tactile_tokens=n_tactile_tokens)
 
         if self.norm is not None:
             output = self.norm(output)
@@ -198,7 +228,8 @@ class TransformerEncoderLayer(nn.Module):
                      src,
                      src_mask: Optional[Tensor] = None,
                      src_key_padding_mask: Optional[Tensor] = None,
-                     pos: Optional[Tensor] = None, pred_action=False):
+                     pos: Optional[Tensor] = None, pred_action=False,
+                     n_tactile_tokens: int = 1):
         # ==== Self-attention ====
         q = k = self.with_pos_embed(src, pos)
         src2 = self.self_attn(q, k, value=src, attn_mask=src_mask,
@@ -208,31 +239,33 @@ class TransformerEncoderLayer(nn.Module):
 
         if self.use_tactile:
             # ==== Cross-attention ====
-            if pred_action:
-                tactile_token = src[:2]
-                tactile_pos = pos[:2]
-                other_tokens = src[4:]
-                other_pos = pos[4:]
-                middle_tokens = src[2:4]
-                middle_pos = pos[2:4]
-            else:
-                tactile_token = src[:1]
-                tactile_pos = pos[:1]
-                other_tokens = src[3:]
-                other_pos = pos[3:]
-                middle_tokens = src[1:3]
-                middle_pos = pos[1:3]
+            # n_tac = number of tactile tokens (n_tactile_tokens) +
+            #         tactile_pred token (1 if pred_action else 0).
+            # Layout: [tactile_0..n-1 | tactile_pred(opt) | latent | proprio | visual...]
+            # Cross-attn: tactile_tokens <-> visual(other_tokens);
+            #             middle_tokens (latent+proprio) are unchanged.
+            #
+            # When n_tactile_tokens=1:
+            #   pred_action=True  → n_tac=2: identical to original src[:2]/src[2:4]/src[4:]
+            #   pred_action=False → n_tac=1: identical to original src[:1]/src[1:3]/src[3:]
+            n_tac = n_tactile_tokens + int(pred_action)
+            tactile_token = src[:n_tac]
+            tactile_pos   = pos[:n_tac]
+            middle_tokens = src[n_tac : n_tac + 2]
+            middle_pos    = pos[n_tac : n_tac + 2]
+            other_tokens  = src[n_tac + 2:]
+            other_pos     = pos[n_tac + 2:]
 
             tactile_token2 = self.cross_attn_1(
                 query=self.with_pos_embed(tactile_token, tactile_pos),
                 key=self.with_pos_embed(other_tokens, other_pos),
                 value=other_tokens)[0]
-            
+
             other_tokens2 = self.cross_attn_2(
                 query=self.with_pos_embed(other_tokens, other_pos),
                 key=self.with_pos_embed(tactile_token, tactile_pos),
                 value=tactile_token)[0]
-            
+
             tactile_token = tactile_token + self.dropout2(tactile_token2)
             tactile_token = self.norm2(tactile_token)
             other_tokens = other_tokens + self.dropout3(other_tokens2)
@@ -263,10 +296,12 @@ class TransformerEncoderLayer(nn.Module):
     def forward(self, src,
                 src_mask: Optional[Tensor] = None,
                 src_key_padding_mask: Optional[Tensor] = None,
-                pos: Optional[Tensor] = None, pred_action=False):
+                pos: Optional[Tensor] = None, pred_action=False,
+                n_tactile_tokens: int = 1):
         if self.normalize_before:
             return self.forward_pre(src, src_mask, src_key_padding_mask, pos)
-        return self.forward_post(src, src_mask, src_key_padding_mask, pos, pred_action=pred_action)
+        return self.forward_post(src, src_mask, src_key_padding_mask, pos,
+                                 pred_action=pred_action, n_tactile_tokens=n_tactile_tokens)
 
 
 class TransformerDecoderLayer(nn.Module):

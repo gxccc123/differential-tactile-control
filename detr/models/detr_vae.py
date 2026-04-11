@@ -2,6 +2,12 @@
 """
 DETR model and criterion classes.
 """
+import sys as _sys, os as _os
+_DTC_ROOT = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+if _DTC_ROOT not in _sys.path:
+    _sys.path.insert(0, _DTC_ROOT)
+from models.structured_tactile_encoder import StructuredTactileEncoder
+
 import torch
 from torch import nn
 from torch.autograd import Variable
@@ -12,6 +18,30 @@ import numpy as np
 
 import IPython
 e = IPython.embed
+
+
+class DifferentialTactileEncoder(nn.Module):
+    """
+    Encode a flattened tactile history [B, T*D] into a hidden_dim token
+    by computing frame-wise first-order differences along the time axis.
+
+    d_0 = 0
+    d_t = x_t - x_{t-1}   for t = 1 .. T-1
+    """
+    def __init__(self, tactile_dim_all: int, hidden_dim: int, tac_history_cnt: int = 18):
+        super().__init__()
+        self.tac_history_cnt = tac_history_cnt
+        self.tactile_dim = tactile_dim_all // tac_history_cnt
+        self.proj = nn.Linear(tactile_dim_all, hidden_dim)
+
+    def forward(self, tactile_flat):
+        # tactile_flat: [B, T*D]
+        B = tactile_flat.shape[0]
+        x = tactile_flat.view(B, self.tac_history_cnt, self.tactile_dim)  # [B, T, D]
+        diff = torch.zeros_like(x)                                         # d_0 = 0
+        diff[:, 1:, :] = x[:, 1:, :] - x[:, :-1, :]                      # d_t = x_t - x_{t-1}
+        diff_flat = diff.view(B, -1)                                       # [B, T*D]
+        return self.proj(diff_flat)                                        # [B, hidden_dim]
 
 
 def reparametrize(mu, logvar):
@@ -33,7 +63,8 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, use_tactile):
+    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, use_tactile,
+                 use_differential_tactile=False, use_structured_tactile=False):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -69,10 +100,28 @@ class DETRVAE(nn.Module):
             self.pos = torch.nn.Embedding(2, hidden_dim)
             self.backbones = None
 
+        self.use_differential_tactile = use_differential_tactile
+        self.use_structured_tactile = use_structured_tactile
         if use_tactile:
             self.input_proj_tactile = nn.Linear(tactile_dim_all, hidden_dim)
             self.tactile_head = nn.Linear(hidden_dim, tactile_dim)
             self.query_embed_tactile = nn.Embedding(18, hidden_dim)
+            if use_differential_tactile:
+                self.tactile_diff_encoder = DifferentialTactileEncoder(
+                    tactile_dim_all=tactile_dim_all,
+                    hidden_dim=hidden_dim,
+                    tac_history_cnt=18,
+                )
+                self.tactile_fusion = nn.Linear(hidden_dim * 2, hidden_dim)
+            if use_structured_tactile:
+                # StructuredTactileEncoder outputs two tokens: t^s and t^dyn.
+                # Registered here; called in forward (Step 3).
+                self.structured_tactile_encoder = StructuredTactileEncoder(
+                    tactile_dim=tactile_dim,
+                    tac_history_cnt=18,
+                    stem_dim=64,
+                    hidden_dim=hidden_dim,
+                )
 
         # encoder extra parameters
         self.latent_dim = 32 # final size of latent z # TODO tune
@@ -85,7 +134,21 @@ class DETRVAE(nn.Module):
         # decoder extra parameters
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim) # project latent sample to embedding
         if use_tactile:
-            self.additional_pos_embed = nn.Embedding(4, hidden_dim)
+            if use_structured_tactile:
+                # 5-slot layout (Step 3 wires these up):
+                #   [0] t^s (state token)
+                #   [1] t^dyn (dynamic token)
+                #   [2] tactile_pred
+                #   [3] latent
+                #   [4] proprio
+                self.additional_pos_embed = nn.Embedding(5, hidden_dim)
+            else:
+                # Original 4-slot layout:
+                #   [0] tactile
+                #   [1] tactile_pred
+                #   [2] latent
+                #   [3] proprio
+                self.additional_pos_embed = nn.Embedding(4, hidden_dim)
         else:
             self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for proprio and latent
 
@@ -147,18 +210,77 @@ class DETRVAE(nn.Module):
             src = torch.cat(all_cam_features, axis=3)
             pos = torch.cat(all_cam_pos, axis=3)
             if self.use_tactile:
-                tactile_input = self.input_proj_tactile(tactile)
-                hs_tactile = self.transformer(src, None, self.query_embed_tactile.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight, tactile_input, None)[0]
-                tactile_hat = self.tactile_head(hs_tactile)  ##[bs, 18, tactile_dim]
-                B, T, D = tactile_hat.shape
-                if epoch < 75:
-                    tactile_pred_input = tactile_next.view(B, T * D)
+                if self.use_structured_tactile:
+                    # ── Structured tactile path ──────────────────────────
+                    # Produces two semantic tokens from the tactile history:
+                    #   t_s   [B, H] : stable contact state
+                    #   t_dyn [B, H] : velocity + residual dynamics
+                    #
+                    # Token layout fed into transformer:
+                    #   hs_tactile call (pred_action=False, n_tactile_tokens=2):
+                    #     [t_s, t_dyn, latent, proprio, visual...]
+                    #   hs call        (pred_action=True,  n_tactile_tokens=2):
+                    #     [t_s, t_dyn, tactile_pred, latent, proprio, visual...]
+                    #
+                    # positional embed slots (additional_pos_embed [5, H]):
+                    #   [0]=t_s  [1]=t_dyn  [2]=tactile_pred  [3]=latent  [4]=proprio
+                    t_s, t_dyn = self.structured_tactile_encoder(tactile)   # each [B, H]
+
+                    hs_tactile = self.transformer(
+                        src, None, self.query_embed_tactile.weight, pos,
+                        latent_input, proprio_input,
+                        self.additional_pos_embed.weight,
+                        tactile=t_s, tactile_pred=None, tactile_dyn=t_dyn,
+                    )[0]
+                    tactile_hat = self.tactile_head(hs_tactile)             # [B, 18, tactile_dim]
+                    B, T, D = tactile_hat.shape
+                    if epoch < 75:
+                        tactile_pred_input = tactile_next.view(B, T * D)
+                    else:
+                        tactile_pred_input = tactile_hat.view(B, T * D)
+                    tactile_pred_input = self.input_proj_tactile(tactile_pred_input)
+
+                    hs = self.transformer(
+                        src, None, self.query_embed.weight, pos,
+                        latent_input, proprio_input,
+                        self.additional_pos_embed.weight,
+                        tactile=t_s, tactile_pred=tactile_pred_input, tactile_dyn=t_dyn,
+                    )[0]
                 else:
-                    tactile_pred_input = tactile_hat.view(B, T * D)
-                tactile_pred_input = self.input_proj_tactile(tactile_pred_input)
-                hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight, tactile_input, tactile_pred_input)[0]
+                    # ── Original single-token path (baseline or diff) ────
+                    # Unchanged from the pre-Step-3 code.
+                    tactile_input = self.input_proj_tactile(tactile)        # [B, H]
+                    if self.use_differential_tactile:
+                        diff_input = self.tactile_diff_encoder(tactile)     # [B, H]
+                        tactile_input = self.tactile_fusion(
+                            torch.cat([tactile_input, diff_input], dim=-1)  # [B, H*2] → [B, H]
+                        )
+                    hs_tactile = self.transformer(
+                        src, None, self.query_embed_tactile.weight, pos,
+                        latent_input, proprio_input,
+                        self.additional_pos_embed.weight,
+                        tactile_input, None,
+                    )[0]
+                    tactile_hat = self.tactile_head(hs_tactile)             # [B, 18, tactile_dim]
+                    B, T, D = tactile_hat.shape
+                    if epoch < 75:
+                        tactile_pred_input = tactile_next.view(B, T * D)
+                    else:
+                        tactile_pred_input = tactile_hat.view(B, T * D)
+                    tactile_pred_input = self.input_proj_tactile(tactile_pred_input)
+
+                    hs = self.transformer(
+                        src, None, self.query_embed.weight, pos,
+                        latent_input, proprio_input,
+                        self.additional_pos_embed.weight,
+                        tactile_input, tactile_pred_input,
+                    )[0]
             else:
-                hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
+                hs = self.transformer(
+                    src, None, self.query_embed.weight, pos,
+                    latent_input, proprio_input,
+                    self.additional_pos_embed.weight,
+                )[0]
                 tactile_hat = None
         else:
             qpos = self.input_proj_robot_state(qpos)
@@ -280,7 +402,9 @@ def build(args):
         state_dim=state_dim,
         num_queries=args.num_queries,
         camera_names=args.camera_names,
-        use_tactile = args.use_tactile
+        use_tactile=args.use_tactile,
+        use_differential_tactile=getattr(args, 'use_differential_tactile', False),
+        use_structured_tactile=getattr(args, 'use_structured_tactile', False),
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
